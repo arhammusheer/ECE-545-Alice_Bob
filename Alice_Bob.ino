@@ -25,6 +25,20 @@ enum SecurityLevel {
   LEVEL2
 };
 
+// Utility function for modular exponentiation
+long modExp(long base, long exponent, long modulus) {
+  long result = 1;
+  base = base % modulus;
+  while (exponent > 0) {
+    if (exponent % 2 == 1) {  // If exponent is odd
+      result = (result * base) % modulus;
+    }
+    exponent = exponent >> 1;    // exponent = exponent / 2
+    base = (base * base) % modulus;
+  }
+  return result;
+}
+
 // DisplayManager class handles all display-related functionalities
 class DisplayManager {
 public:
@@ -107,49 +121,144 @@ private:
   int line;
 };
 
+// DiffieHellmanManager handles the DH key exchange process
+class DiffieHellmanManager {
+public:
+  DiffieHellmanManager(DisplayManager &displayManager)
+      : displayManager(displayManager), state(IDLE), sharedKeyAvailable(false) {}
+
+  void initiate(bool isAlice);
+  void processMessage(const char *message, bool isAlice);
+  bool isSharedKeyAvailable() { return sharedKeyAvailable; }
+  int getSharedKey() { return sharedKey; }
+  void reset() {
+    state = IDLE;
+    sharedKeyAvailable = false;
+  }
+
+private:
+  DisplayManager &displayManager;
+  enum State {
+    IDLE,
+    SENT_PG,
+    RECEIVED_ACK,
+    SENT_A_PREKEY,
+    RECEIVED_B_PREKEY
+  };
+  State state;
+  bool sharedKeyAvailable;
+  int sharedKey;
+
+  // DH parameters
+  long p;
+  long g;
+  int privateKey;
+  long publicKey;
+  long remotePublicKey;
+};
+
+void DiffieHellmanManager::initiate(bool isAlice) {
+  if (isAlice && state == IDLE) {
+    // Alice sends p and g
+    p = 2089;  // Large prime number
+    g = 2;     // Primitive root modulo p
+    String message = "PG:" + String(p) + "," + String(g);
+    // Do not display p and g on the screen
+    Serial1.println(message);
+    state = SENT_PG;
+  }
+}
+
+void DiffieHellmanManager::processMessage(const char *message, bool isAlice) {
+  String msgStr = String(message);
+
+  if (msgStr.startsWith("PG:")) {
+    // Bob receives p and g, replies with ACK
+    if (!isAlice && state == IDLE) {
+      String params = msgStr.substring(3);
+      int commaIndex = params.indexOf(',');
+      p = params.substring(0, commaIndex).toInt();
+      g = params.substring(commaIndex + 1).toInt();
+
+      // Send ACK
+      String ackMessage = "ACK";
+      Serial1.println(ackMessage);
+      state = RECEIVED_ACK;
+    }
+  } else if (msgStr.startsWith("ACK")) {
+    // Alice receives ACK, sends Alice-Pre-Key
+    if (isAlice && state == SENT_PG) {
+      // Generate private and public keys
+      privateKey = random(2, p - 2);
+      publicKey = modExp(g, privateKey, p);
+      String preKeyMessage = "AKEY:" + String(publicKey);
+      Serial1.println(preKeyMessage);
+      state = RECEIVED_ACK;
+    }
+  } else if (msgStr.startsWith("AKEY:")) {
+    // Bob receives Alice-Pre-Key, sends Bob-Pre-Key
+    if (!isAlice && state == RECEIVED_ACK) {
+      String keyStr = msgStr.substring(5);
+      remotePublicKey = keyStr.toInt();
+
+      // Generate private and public keys
+      privateKey = random(2, p - 2);
+      publicKey = modExp(g, privateKey, p);
+
+      // Compute shared key
+      sharedKey = modExp(remotePublicKey, privateKey, p);
+      sharedKeyAvailable = true;
+
+      String preKeyMessage = "BKEY:" + String(publicKey);
+      Serial1.println(preKeyMessage);
+      state = RECEIVED_B_PREKEY;
+    }
+  } else if (msgStr.startsWith("BKEY:")) {
+    // Alice receives Bob-Pre-Key, computes shared key
+    if (isAlice && state == RECEIVED_ACK) {
+      String keyStr = msgStr.substring(5);
+      remotePublicKey = keyStr.toInt();
+
+      // Compute shared key
+      sharedKey = modExp(remotePublicKey, privateKey, p);
+      sharedKeyAvailable = true;
+      state = RECEIVED_B_PREKEY;
+    }
+  }
+}
+
 // CommunicationManager class handles sending and receiving messages
 class CommunicationManager {
 public:
-  CommunicationManager(DisplayManager &displayManager)
-      : displayManager(displayManager), sharedKeyAvailable(false) {}
+  CommunicationManager(DisplayManager &displayManager, DiffieHellmanManager &dhManager)
+      : displayManager(displayManager), dhManager(dhManager) {}
 
   void begin() {
     Serial1.begin(9600);
   }
 
   void sendPlainText(const char *message) {
-    displayManager.displayMessage(("-> " + String(message)).c_str());
+    // Display only the plain text message
+    displayManager.displayMessage(("Sent: " + String(message)).c_str());
     Serial1.println(message);
   }
 
   void sendEncrypted(const char *message) {
     // Encrypt the message using the shared key (simple XOR encryption)
     String encryptedMessage = encryptMessage(message);
-    displayManager.displayMessage(("-> " + encryptedMessage).c_str());
+    // Do not display the encrypted message
     Serial1.println(encryptedMessage);
   }
 
   void onReceive(bool isAlice, SecurityLevel currentLevel);
 
-  // Diffie-Hellman key exchange functions
-  void initiateDH(bool isAlice);
-  void processDHMessage(const char *message);
-
   // Simple encryption/decryption
   String encryptMessage(const char *plainText);
   String decryptMessage(const char *cipherText);
 
-  bool sharedKeyAvailable;
-  int sharedKey;
-
 private:
   DisplayManager &displayManager;
-  // Diffie-Hellman variables
-  int p;        // Prime modulus
-  int g;        // Primitive root modulo p
-  int privateKey;
-  int publicKey;
-  int remotePublicKey;
+  DiffieHellmanManager &dhManager;
 };
 
 void CommunicationManager::onReceive(bool isAlice, SecurityLevel currentLevel) {
@@ -158,20 +267,20 @@ void CommunicationManager::onReceive(bool isAlice, SecurityLevel currentLevel) {
 
     if (currentLevel == LEVEL0) {
       // Level 0: Plain-text communication
-      displayManager.displayMessage(("<- " + receivedMessage).c_str());
+      displayManager.displayMessage(("Recv: " + receivedMessage).c_str());
     } else if (currentLevel == LEVEL1) {
       // Level 1: Encrypted communication
-      if (receivedMessage.startsWith("DH:")) {
-        // Process Diffie-Hellman key exchange message
-        processDHMessage(receivedMessage.c_str());
+      if (receivedMessage.startsWith("PG:") || receivedMessage.startsWith("ACK") ||
+          receivedMessage.startsWith("AKEY:") || receivedMessage.startsWith("BKEY:")) {
+        // Process Diffie-Hellman key exchange messages
+        dhManager.processMessage(receivedMessage.c_str(), isAlice);
       } else {
-        // Encrypted message
-        displayManager.displayMessage(("<- " + receivedMessage).c_str());
-
-        if (sharedKeyAvailable) {
+        if (dhManager.isSharedKeyAvailable()) {
           String decryptedMessage = decryptMessage(receivedMessage.c_str());
-          displayManager.displayMessage(("Decrypted: " + decryptedMessage).c_str());
+          // Display only the decrypted plain text message
+          displayManager.displayMessage(("Recv: " + decryptedMessage).c_str());
         } else {
+          // Display a message indicating the shared key is not available
           displayManager.displayMessage("Shared key not available");
         }
       }
@@ -179,40 +288,12 @@ void CommunicationManager::onReceive(bool isAlice, SecurityLevel currentLevel) {
   }
 }
 
-void CommunicationManager::initiateDH(bool isAlice) {
-  // Use small prime numbers for p and g
-  p = 23;  // Prime modulus
-  g = 5;   // Primitive root modulo p
-
-  // Generate private key (random number less than p)
-  privateKey = random(1, p);
-  // Compute public key
-  publicKey = (int)pow(g, privateKey) % p;
-
-  // Send public key
-  String message = "DH:" + String(publicKey);
-  displayManager.displayMessage(("-> " + message).c_str());
-  Serial1.println(message);
-}
-
-void CommunicationManager::processDHMessage(const char *message) {
-  // Extract public key from message
-  String msgStr = String(message);
-  remotePublicKey = msgStr.substring(3).toInt();
-
-  // Compute shared secret
-  int sharedSecret = (int)pow(remotePublicKey, privateKey) % p;
-  sharedKey = sharedSecret;
-  sharedKeyAvailable = true;
-
-  displayManager.displayMessage(("Shared key: " + String(sharedKey)).c_str());
-}
-
 String CommunicationManager::encryptMessage(const char *plainText) {
   // Simple XOR encryption with sharedKey
+  int key = dhManager.getSharedKey() % 256;
   String encryptedText = "";
   for (size_t i = 0; i < strlen(plainText); i++) {
-    char encryptedChar = plainText[i] ^ sharedKey;
+    char encryptedChar = plainText[i] ^ key;
     encryptedText += String((int)encryptedChar) + " ";  // Store ASCII values
   }
   return encryptedText;
@@ -220,6 +301,7 @@ String CommunicationManager::encryptMessage(const char *plainText) {
 
 String CommunicationManager::decryptMessage(const char *cipherText) {
   // Simple XOR decryption with sharedKey
+  int key = dhManager.getSharedKey() % 256;
   String decryptedText = "";
   String cipherStr = String(cipherText);
   int start = 0;
@@ -227,7 +309,7 @@ String CommunicationManager::decryptMessage(const char *cipherText) {
   while (end != -1) {
     String charCodeStr = cipherStr.substring(start, end);
     char encryptedChar = (char)charCodeStr.toInt();
-    char decryptedChar = encryptedChar ^ sharedKey;
+    char decryptedChar = encryptedChar ^ key;
     decryptedText += decryptedChar;
     start = end + 1;
     end = cipherStr.indexOf(' ', start);
@@ -235,11 +317,29 @@ String CommunicationManager::decryptMessage(const char *cipherText) {
   return decryptedText;
 }
 
+// LevelManager handles the different security levels
+class LevelManager {
+public:
+  LevelManager()
+      : currentLevel(LEVEL0) {}
+
+  void nextLevel() {
+    currentLevel = static_cast<SecurityLevel>((currentLevel + 1) % 2);  // LEVEL0 and LEVEL1
+  }
+
+  SecurityLevel getCurrentLevel() {
+    return currentLevel;
+  }
+
+private:
+  SecurityLevel currentLevel;
+};
+
 // Alice class contains the logic specific to Alice
 class Alice {
 public:
-  Alice(CommunicationManager &commManager)
-      : commManager(commManager), sequenceNumber(1), lastSendTime(0), dhInitiated(false) {}
+  Alice(CommunicationManager &commManager, DiffieHellmanManager &dhManager)
+      : commManager(commManager), dhManager(dhManager), sequenceNumber(1), lastSendTime(0), dhInitiated(false) {}
 
   void run(SecurityLevel currentLevel) {
     if (currentLevel == LEVEL0) {
@@ -268,35 +368,50 @@ private:
   void level1() {
     if (!dhInitiated) {
       // Initiate Diffie-Hellman key exchange
-      commManager.initiateDH(true);
+      dhManager.reset();  // Reset DH manager state
+      dhManager.initiate(true);
       dhInitiated = true;
     }
 
-    if (commManager.sharedKeyAvailable) {
-      // Check if it's time to send a new message
-      unsigned long currentMillis = millis();
-      if (currentMillis - lastSendTime >= sendInterval) {
-        // Alice sends an encrypted message
-        String message = "Secret " + String(sequenceNumber);
-        commManager.sendEncrypted(message.c_str());
+    if (dhManager.isSharedKeyAvailable()) {
+      // Send test messages if not already sent
+      if (!testMessagesSent) {
+        // Send Plain_Message_1 and Enc_Message_2
+        String plainMessage = "Plain_Message_1";
+        commManager.sendPlainText(plainMessage.c_str());
 
-        sequenceNumber++;
-        lastSendTime = currentMillis;
+        String encryptedMessage = "Enc_Message_2";
+        commManager.sendEncrypted(encryptedMessage.c_str());
+
+        testMessagesSent = true;
+        lastSendTime = millis();  // Reset the send timer
+      } else {
+        // Continue sending encrypted messages periodically
+        unsigned long currentMillis = millis();
+        if (currentMillis - lastSendTime >= sendInterval) {
+          String message = "New " + String(sequenceNumber);
+          commManager.sendEncrypted(message.c_str());
+          sequenceNumber++;
+
+          lastSendTime = currentMillis;
+        }
       }
     }
   }
 
   CommunicationManager &commManager;
+  DiffieHellmanManager &dhManager;
   int sequenceNumber;
   unsigned long lastSendTime;
   bool dhInitiated;
+  bool testMessagesSent = false;
 };
 
 // Bob class contains the logic specific to Bob
 class Bob {
 public:
-  Bob(CommunicationManager &commManager)
-      : commManager(commManager), sequenceNumber(1), dhInitiated(false) {}
+  Bob(CommunicationManager &commManager, DiffieHellmanManager &dhManager)
+      : commManager(commManager), dhManager(dhManager), sequenceNumber(1), dhInitiated(false) {}
 
   void run(SecurityLevel currentLevel) {
     if (currentLevel == LEVEL0) {
@@ -311,37 +426,52 @@ public:
 private:
   void level1() {
     if (!dhInitiated) {
-      // Initiate Diffie-Hellman key exchange
-      commManager.initiateDH(false);
+      // Wait for Alice to initiate DH key exchange
+      dhManager.reset();  // Reset DH manager state
       dhInitiated = true;
     }
 
-    if (commManager.sharedKeyAvailable) {
-      // Bob can send encrypted messages back to Alice
-      // For demonstration, Bob replies when he receives a message
-      unsigned long currentMillis = millis();
-      if (currentMillis - lastReplyTime >= sendInterval) {
-        String message = "Reply " + String(sequenceNumber);
-        commManager.sendEncrypted(message.c_str());
-        sequenceNumber++;
-        lastReplyTime = currentMillis;
+    if (dhManager.isSharedKeyAvailable()) {
+      if (!testMessagesSent) {
+        // Send Enc_Message_1 and Plain_Message_2
+        String encryptedMessage = "Enc_Message_1";
+        commManager.sendEncrypted(encryptedMessage.c_str());
+
+        String plainMessage = "Plain_Message_2";
+        commManager.sendPlainText(plainMessage.c_str());
+
+        testMessagesSent = true;
+        lastSendTime = millis();  // Reset the send timer
+      } else {
+        // Continue sending encrypted messages periodically
+        unsigned long currentMillis = millis();
+        if (currentMillis - lastSendTime >= sendInterval) {
+          String message = "Rep " + String(sequenceNumber);
+          commManager.sendEncrypted(message.c_str());
+          sequenceNumber++;
+
+          lastSendTime = currentMillis;
+        }
       }
     }
   }
 
   CommunicationManager &commManager;
+  DiffieHellmanManager &dhManager;
   int sequenceNumber;
   bool dhInitiated;
-  unsigned long lastReplyTime = 0;
+  bool testMessagesSent = false;
+  unsigned long lastSendTime = 0;
 };
 
 // Global variables
 bool isAlice = true;
-SecurityLevel currentLevel = LEVEL0;
 
 // Instances
 DisplayManager displayManager;
-CommunicationManager commManager(displayManager);
+LevelManager levelManager;
+DiffieHellmanManager dhManager(displayManager);
+CommunicationManager commManager(displayManager, dhManager);
 Alice *alice = nullptr;
 Bob *bob = nullptr;
 
@@ -362,27 +492,34 @@ void setup() {
   commManager.begin();
 
   // Show status
-  displayManager.showStatus(isAlice, currentLevel);
+  displayManager.showStatus(isAlice, levelManager.getCurrentLevel());
 
   // Initialize Alice or Bob
   if (isAlice) {
-    alice = new Alice(commManager);
+    alice = new Alice(commManager, dhManager);
   } else {
-    bob = new Bob(commManager);
+    bob = new Bob(commManager, dhManager);
   }
-}
-
-void nextSecurityLevel() {
-  // Increment the security level
-  currentLevel = static_cast<SecurityLevel>((currentLevel + 1) % 2);  // Only LEVEL0 and LEVEL1
-  displayManager.showStatus(isAlice, currentLevel);
 }
 
 void loop() {
   if (digitalRead(MODE_SELECT) == LOW) {
     delay(50);  // Initial debounce delay
     if (digitalRead(MODE_SELECT) == LOW) {
-      nextSecurityLevel();
+      levelManager.nextLevel();
+      displayManager.showStatus(isAlice, levelManager.getCurrentLevel());
+
+      // Reset DH state when changing levels
+      dhManager.reset();
+      if (alice != nullptr) {
+        delete alice;
+        alice = new Alice(commManager, dhManager);
+      }
+      if (bob != nullptr) {
+        delete bob;
+        bob = new Bob(commManager, dhManager);
+      }
+
       while (digitalRead(MODE_SELECT) == LOW) {
         delay(50);  // Wait until the button is released
       }
@@ -390,11 +527,11 @@ void loop() {
   }
 
   // Both Alice and Bob check for incoming messages
-  commManager.onReceive(isAlice, currentLevel);
+  commManager.onRecei`ve(isAlice, levelManager.getCurrentLevel());
 
   if (isAlice && alice != nullptr) {
-    alice->run(currentLevel);  // Alice runs her logic based on the security level
+    alice->run(levelManager.getCurrentLevel());  // Alice runs her logic based on the security level
   } else if (bob != nullptr) {
-    bob->run(currentLevel);    // Bob runs his logic based on the security level
+    bob->run(levelManager.getCurrentLevel());    // Bob runs his logic based on the security level
   }
 }
