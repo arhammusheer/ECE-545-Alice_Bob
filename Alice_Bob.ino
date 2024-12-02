@@ -140,10 +140,9 @@ private:
   DisplayManager &displayManager;
   enum State {
     IDLE,
-    SENT_PG,
-    RECEIVED_ACK,
-    SENT_A_PREKEY,
-    RECEIVED_B_PREKEY
+    SENT_PG_AKEY,
+    SENT_PG_BKEY,
+    RECEIVED_PG_BKEY
   };
   State state;
   bool sharedKeyAvailable;
@@ -159,47 +158,30 @@ private:
 
 void DiffieHellmanManager::initiate(bool isAlice) {
   if (isAlice && state == IDLE) {
-    // Alice sends p and g
+    // Alice generates p, g, privateKey, publicKey
     p = 2089;  // Large prime number
     g = 2;     // Primitive root modulo p
-    String message = "PG:" + String(p) + "," + String(g);
+    privateKey = random(2, p - 2);
+    publicKey = modExp(g, privateKey, p);
+    String message = "PG_AKEY:" + String(p) + "," + String(g) + "," + String(publicKey);
     // Do not display p and g on the screen
     Serial1.println(message);
-    state = SENT_PG;
+    state = SENT_PG_AKEY;
   }
 }
 
 void DiffieHellmanManager::processMessage(const char *message, bool isAlice) {
   String msgStr = String(message);
 
-  if (msgStr.startsWith("PG:")) {
-    // Bob receives p and g, replies with ACK
+  if (msgStr.startsWith("PG_AKEY:")) {
     if (!isAlice && state == IDLE) {
-      String params = msgStr.substring(3);
-      int commaIndex = params.indexOf(',');
-      p = params.substring(0, commaIndex).toInt();
-      g = params.substring(commaIndex + 1).toInt();
-
-      // Send ACK
-      String ackMessage = "ACK";
-      Serial1.println(ackMessage);
-      state = RECEIVED_ACK;
-    }
-  } else if (msgStr.startsWith("ACK")) {
-    // Alice receives ACK, sends Alice-Pre-Key
-    if (isAlice && state == SENT_PG) {
-      // Generate private and public keys
-      privateKey = random(2, p - 2);
-      publicKey = modExp(g, privateKey, p);
-      String preKeyMessage = "AKEY:" + String(publicKey);
-      Serial1.println(preKeyMessage);
-      state = RECEIVED_ACK;
-    }
-  } else if (msgStr.startsWith("AKEY:")) {
-    // Bob receives Alice-Pre-Key, sends Bob-Pre-Key
-    if (!isAlice && state == RECEIVED_ACK) {
-      String keyStr = msgStr.substring(5);
-      remotePublicKey = keyStr.toInt();
+      // Bob receives PG_AKEY from Alice
+      String params = msgStr.substring(8); // After "PG_AKEY:"
+      int firstComma = params.indexOf(',');
+      int secondComma = params.indexOf(',', firstComma + 1);
+      p = params.substring(0, firstComma).toInt();
+      g = params.substring(firstComma + 1, secondComma).toInt();
+      remotePublicKey = params.substring(secondComma + 1).toInt();
 
       // Generate private and public keys
       privateKey = random(2, p - 2);
@@ -209,20 +191,34 @@ void DiffieHellmanManager::processMessage(const char *message, bool isAlice) {
       sharedKey = modExp(remotePublicKey, privateKey, p);
       sharedKeyAvailable = true;
 
-      String preKeyMessage = "BKEY:" + String(publicKey);
-      Serial1.println(preKeyMessage);
-      state = RECEIVED_B_PREKEY;
+      // Send back PG_BKEY
+      String responseMessage = "PG_BKEY:" + String(p) + "," + String(g) + "," + String(publicKey);
+      Serial1.println(responseMessage);
+      state = SENT_PG_BKEY;
     }
-  } else if (msgStr.startsWith("BKEY:")) {
-    // Alice receives Bob-Pre-Key, computes shared key
-    if (isAlice && state == RECEIVED_ACK) {
-      String keyStr = msgStr.substring(5);
-      remotePublicKey = keyStr.toInt();
+  } else if (msgStr.startsWith("PG_BKEY:")) {
+    if (isAlice && state == SENT_PG_AKEY) {
+      // Alice receives PG_BKEY from Bob
+      String params = msgStr.substring(8); // After "PG_BKEY:"
+      int firstComma = params.indexOf(',');
+      int secondComma = params.indexOf(',', firstComma + 1);
+      int p_received = params.substring(0, firstComma).toInt();
+      int g_received = params.substring(firstComma + 1, secondComma).toInt();
+      remotePublicKey = params.substring(secondComma + 1).toInt();
 
-      // Compute shared key
-      sharedKey = modExp(remotePublicKey, privateKey, p);
-      sharedKeyAvailable = true;
-      state = RECEIVED_B_PREKEY;
+      // Check if p and g match
+      if (p_received == p && g_received == g) {
+        // Compute shared key
+        sharedKey = modExp(remotePublicKey, privateKey, p);
+        sharedKeyAvailable = true;
+        state = RECEIVED_PG_BKEY;
+      } else {
+        // Handle mismatched p and g
+        // For simplicity, we'll reset the state
+        state = IDLE;
+        sharedKeyAvailable = false;
+        displayManager.displayMessage("Mismatch in p and g");
+      }
     }
   }
 }
@@ -270,8 +266,7 @@ void CommunicationManager::onReceive(bool isAlice, SecurityLevel currentLevel) {
       displayManager.displayMessage(("Recv: " + receivedMessage).c_str());
     } else if (currentLevel == LEVEL1) {
       // Level 1: Encrypted communication
-      if (receivedMessage.startsWith("PG:") || receivedMessage.startsWith("ACK") ||
-          receivedMessage.startsWith("AKEY:") || receivedMessage.startsWith("BKEY:")) {
+      if (receivedMessage.startsWith("PG_AKEY:") || receivedMessage.startsWith("PG_BKEY:")) {
         // Process Diffie-Hellman key exchange messages
         dhManager.processMessage(receivedMessage.c_str(), isAlice);
       } else {
@@ -527,7 +522,7 @@ void loop() {
   }
 
   // Both Alice and Bob check for incoming messages
-  commManager.onRecei`ve(isAlice, levelManager.getCurrentLevel());
+  commManager.onReceive(isAlice, levelManager.getCurrentLevel());
 
   if (isAlice && alice != nullptr) {
     alice->run(levelManager.getCurrentLevel());  // Alice runs her logic based on the security level
