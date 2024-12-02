@@ -191,6 +191,9 @@ void DiffieHellmanManager::processMessage(const char *message, bool isAlice) {
       sharedKey = modExp(remotePublicKey, privateKey, p);
       sharedKeyAvailable = true;
 
+      // Display Shared Key
+      displayManager.displayMessage(("Shared Key: " + String(sharedKey)).c_str());
+
       // Send back PG_BKEY
       String responseMessage = "PG_BKEY:" + String(p) + "," + String(g) + "," + String(publicKey);
       Serial1.println(responseMessage);
@@ -211,6 +214,10 @@ void DiffieHellmanManager::processMessage(const char *message, bool isAlice) {
         // Compute shared key
         sharedKey = modExp(remotePublicKey, privateKey, p);
         sharedKeyAvailable = true;
+
+        // Display Shared Key
+        displayManager.displayMessage(("Shared Key: " + String(sharedKey)).c_str());
+        
         state = RECEIVED_PG_BKEY;
       } else {
         // Handle mismatched p and g
